@@ -9,6 +9,7 @@ import time
 import getpass
 import configparser
 try:
+    import dbus
     import bluetooth
     from bluetooth import *
     import bluetooth._bluetooth as bt
@@ -236,7 +237,8 @@ Thanks :)\n""")
 def debug_mode():
     while True:
         global DEBUG
-        DEBUG = input("Would you like to activate debug mode? [Y/N] ")
+        # DEBUG = input("Would you like to activate debug mode? [Y/N] ")
+        DEBUG = "Y"
         DEBUG = DEBUG.upper()
         if DEBUG == "Y":
             print("DEBUG is active")
@@ -283,75 +285,142 @@ def print_contributors():
 #    print("jellykells Fixed a bug")
     print("Thanks to all of them :)\n")
     time.sleep(4)
+
+def get_lock_status():
+    if ENV == "GNOME":
+        try:
+            bus = dbus.SessionBus()
+            screensaver = bus.get_object('org.gnome.ScreenSaver', '/org/gnome/ScreenSaver')
+            interface = dbus.Interface(screensaver, 'org.gnome.ScreenSaver')
+            status = bool(interface.GetActive())
+            if not status:
+                return "unlocked"
+            else:
+                return "locked"
+        except subprocess.CalledProcessError as e:
+            if DEBUG == "Y":
+                print(f"Error occurred: {e}")
+            return None
+    else:
+        # not implemented for other desktop environments
+        return None
+
+def get_bluetooth_rssi(mac_address):
+    try:
+        bus = dbus.SystemBus()
+        manager = dbus.Interface(
+            bus.get_object("org.bluez", "/"),
+            "org.freedesktop.DBus.ObjectManager"
+        )
+        objects = manager.GetManagedObjects()
+
+        # Iterate through all Bluetooth devices
+        for path, interfaces in objects.items():
+            if "org.bluez.Device1" in interfaces:
+                device_props = interfaces["org.bluez.Device1"]
+                if device_props["Address"].upper() == mac_address.upper():
+                    return int(device_props.get("RSSI", None))
+        return None
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
 #Variables for Main code
 CHECKINTERVAL = 3 # device pinged at this interval (seconds) when screen is unlocked min:3
 CHECKREPEAT = 2  # device must be unreachable this many times to lock
 mode = "unlocked"
+LOWER_THRESHOLD = -80 # RSSI threshold to lock the screen
+UPPER_THRESHOLD = -70 # RSSI threshold to unlock the screen
 
 #Main code for Bluetooth-Unlock
 #Return code 0 is when the command has ran successfully
 #Return code 1 is when the command has failed to reach the device
 def main_bu_code():
+    global mode
     print("Bluetooth-Unlock is now active!")
+    tries = 0
     while True:
-        tries = 0
-        while tries < CHECKREPEAT:
-            #Checks for the device
-            time.sleep(CHECKINTERVAL)
-            check = subprocess.Popen(["l2ping", DEVADDR, "-t", "1", "-c", "1"], shell=False, stdout=subprocess.PIPE)
-            check.wait()
-            retcode = check.returncode
-            if retcode == 0 and DEBUG == "Y":
-                print("ping OK!")
-                break
-            elif retcode > 0 and DEBUG == "Y":
-                #Prints returncode when debug is active
-                print("ping response code: %d" % (retcode))
-                time.sleep(1)
-                tries = tries + 1
-
-            if retcode == "Can\'t create socket: Operation not permitted":
-                print("Couldn't create a socket due to permissions")
-
-                #Unlocks when the device IS found
-                if retcode == 0 and mode == "locked":
-                    mode = "unlocked"
-                if ENV == "LOGINCTL":
-                    os.system("loginctl unlock-session")
-                elif ENV == "KDE":
-                    os.system("loginctl unlock-session")
-                elif ENV == "GNOME":
-                    os.system("gnome-screensaver-command -d")
-                elif ENV == "XSCREENSAVER":
-                    os.system("pkill xscreensaver")
-                elif ENV == "MATE":
-                    os.system("mate-screensaver-command -d")
-                elif ENV == "CINNAMON":
-                    os.system("cinnamon-screensaver-command -d")
-
-                #Locks when the device ISN'T found
-                if retcode > 0 and mode == "unlocked":
-                    mode = "locked"
-                if ENV == "LOGINCTL":
-                    os.system("loginctl lock-session")
-                elif ENV == "KDE":
-                    os.system("loginctl lock-session")
-                elif ENV == "GNOME":
-                    os.system("gnome-screensaver-command -l")
-                elif ENV == "XSCREENSAVER":
-                    os.system("xscreensaver-command -lock")
-                elif ENV == "MATE":
-                    os.system("mate-screensaver-command -l")
-                elif ENV == "CINNAMON":
-                    os.system("cinnamon-screensaver-command -l")
-
-                if mode == "locked":
-                    time.sleep(1)
+        # while tries < CHECKREPEAT:
+        #Checks for the device
+        time.sleep(CHECKINTERVAL)
+        stdout = ""
+        returncode = 0
+        signal_strength = -255
+        try: 
+            check = subprocess.run(["l2ping", DEVADDR, "-t", "1", "-c", "1"], capture_output=True, text=True, check=True)
+            returncode = int(check.returncode)
+            stdout = check.stdout.strip()
+            if returncode == 0:
+                signal_strength = get_bluetooth_rssi(DEVADDR)
+                if DEBUG == "Y":
+                    print(f"{signal_strength=}")
+                if signal_strength < LOWER_THRESHOLD:
+                    tries += 1
                 else:
-                    time.sleep(CHECKINTERVAL)
+                    tries = 0
+                if DEBUG == "Y":
+                    print("ping OK!")
+            elif returncode > 0:
+                tries = tries + 1
+                #Prints returncode when debug is active
+                if DEBUG == "Y":
+                    print(f"{returncode=}")
+                    print(f"{stdout=}")
+                    print(f"{tries=}")
+        except subprocess.CalledProcessError as e:
+            stdout = e.stderr.strip()
+            returncode = int(e.returncode)
+            tries = tries + 1
+            if DEBUG == "Y":
+                print(f"{returncode=}")
+                print(f"{stdout=}")
+                print(f"{tries=}")
 
-check_version()
-check_update()
+        dynamic_lock_status = get_lock_status()
+        mode = dynamic_lock_status or mode
+
+        #Unlocks when the device IS found
+        if returncode == 0 and mode == "locked" and signal_strength > UPPER_THRESHOLD:
+            tries = 0
+            mode = "unlocked"
+            if DEBUG == "Y":
+                print("Device found! Unlocked!")
+
+            if ENV == "LOGINCTL":
+                os.system("loginctl unlock-session")
+            elif ENV == "KDE":
+                os.system("loginctl unlock-session")
+            elif ENV == "GNOME":
+                os.system("gnome-screensaver-command -d")
+            elif ENV == "XSCREENSAVER":
+                os.system("pkill xscreensaver")
+            elif ENV == "MATE":
+                os.system("mate-screensaver-command -d")
+            elif ENV == "CINNAMON":
+                os.system("cinnamon-screensaver-command -d")
+
+        #Locks when the device ISN'T found
+        if returncode > 0 and stdout == "Can't connect: Host is down" and mode == "unlocked" and tries == CHECKREPEAT:
+            if DEBUG == "Y":
+                print(f"Device not found for {tries} times! Locked!")
+            tries = 0
+            mode = "locked"
+
+            if ENV == "LOGINCTL":
+                os.system("loginctl lock-session")
+            elif ENV == "KDE":
+                os.system("loginctl lock-session")
+            elif ENV == "GNOME":
+                os.system("gnome-screensaver-command -l")
+            elif ENV == "XSCREENSAVER":
+                os.system("xscreensaver-command -lock")
+            elif ENV == "MATE":
+                os.system("mate-screensaver-command -l")
+            elif ENV == "CINNAMON":
+                os.system("cinnamon-screensaver-command -l")
+
+# check_version()
+# check_update()
 load_options()
 available_desktop()
 select_env()
